@@ -2972,13 +2972,21 @@ async function zhsLoginOnce(
   diag.ssoLastUrl = follow.lastUrl;
   diag.ssoSawTicket = follow.sawTicket;
 
-  // 3) Exchange the session for a Polymas token (no body, per the docs).
+  // 3) Exchange the session for a Polymas token. The real browser flows
+  // (login page bundle + Polymas H5 bundle) call this with axios .get and
+  // no params; the POST variant 500s ("操作失败"), so mirror the GET.
   diag.stage = "token";
   let tokRaw: unknown;
   try {
     const res = await fetch(`${ZHS_POLYMAS}/teachingCenterAi/polymasApi/getToken`, {
-      method: "POST",
-      headers: { ...ZHS_HEADERS, Cookie: jar.header() },
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+        Origin: "https://www.zhihuishu.com",
+        Referer: "https://www.zhihuishu.com/",
+        "User-Agent": ZHS_UA,
+        Cookie: jar.header(),
+      },
       signal,
     });
     jar.collect(res);
