@@ -2239,17 +2239,33 @@ async function relayLazynutSignInSubmit(
 //      {"status":-4,"msg":"滑动验证码校验失败"}, i.e. it decrypted the
 //      body and judged the captcha, so the request format is right. The
 //      password is used for this one login only and then dropped — never
-//      stored, never logged.
-//   3) The server follows the CAS SSO hop the login page does in the
-//      browser (passport.zhihuishu.com/login?service=<cloudapi
-//      oauth/login/ssoLogin>) to turn the CAS session into a Polymas
-//      session, then POSTs /teachingCenterAi/polymasApi/getToken for the
-//      Polymas token. The token and the cookie jar live ONLY in server
-//      memory (module-level, per account), never in the database, never
-//      in logs; they are dropped after 60 minutes or on the first 401.
-//      Steps 2-3 were NOT verifiable end-to-end in the sandbox (the real
-//      password lives only on the owner's phone and a validate only comes
-//      from his own slider) — the owner has to try it in the App.
+//      stored, never logged. Before the POST the server GETs
+//      https://login.zhihuishu.com/ once so the POST carries the same
+//      session cookies a browser would have; the POST follows redirects
+//      manually so Set-Cookie is collected on every hop.
+//   3) The server then does exactly what the login page does in the
+//      browser (userStore goOnceLogin/LoginDirectly): it navigates to
+//      passport.zhihuishu.com/login?pwd=<rt.pwd>&service=<cloudapi
+//      oauth/login/ssoLogin?redirect=...>. The one-time password in
+//      rt.pwd is what makes passport issue the CAS session — WITHOUT it
+//      passport has nothing to authenticate, no CASTGC/CASLOGC cookies
+//      are set, and getToken answers 401 "拒绝访问，未登录！". That was
+//      the bug until 2026-11-23 23:40: the old code called the same URL
+//      without pwd, so a correct password + a valid captcha still ended
+//      in 401. The redirect chain is followed manually (3xx, meta
+//      refresh, auto-submit form, JS location) and its end state is
+//      reported in the prepare response diagnostics (stage,
+//      loginStatus, tokenCode, hopCount, ssoLastStatus/Url/Ticket).
+//      Then the server POSTs /teachingCenterAi/polymasApi/getToken with
+//      NO body for the Polymas token. The token and the cookie jar live
+//      ONLY in server memory (module-level, per account), never in the
+//      database, never in logs; they are dropped after 60 minutes or on
+//      the first 401. Steps 2-3 with a REAL password + validate were NOT
+//      verifiable end-to-end in the sandbox (the real password lives
+//      only on the owner's phone and a validate only comes from his own
+//      slider) — the owner has to try it in the App; with a fake
+//      validate the chain correctly stops at stage "login" with
+//      status -4.
 //   4) Sign-in APIs (host https://cloudapi.polymas.com, header
 //      Authorization: <token>) — all verified to exist (401 without a
 //      login, 2026-11-23): POST /student-app/api/sign/student (submit),
@@ -2386,8 +2402,51 @@ type zhsPrepareResponse = {
   ok: boolean,
   message: string,
   sessionReady: boolean,
+  // Diagnostics (no secrets: only stage codes, status codes and URLs
+  // with the query string stripped — never cookie values, tickets or
+  // passwords). Added 2026-11-23 when the SSO hop kept failing.
+  stage: "login" | "sso" | "token" | "done",
+  loginStatus: number | null,
+  tokenCode: number | string | null,
+  hopCount: number,
+  ssoLastStatus: number | null,
+  ssoLastUrl: string,
+  ssoSawTicket: boolean,
+  isSkipPolymas: boolean,
+  hasOncePwd: boolean,
+  preGetStatus: number | null,
 
 };
+
+/** Diagnostics carried through zhsLoginOnce (same fields as above). */
+type ZhsLoginDiag = {
+  stage: "login" | "sso" | "token" | "done",
+  loginStatus: number | null,
+  tokenCode: number | string | null,
+  hopCount: number,
+  ssoLastStatus: number | null,
+  ssoLastUrl: string,
+  ssoSawTicket: boolean,
+  isSkipPolymas: boolean,
+  hasOncePwd: boolean,
+  preGetStatus: number | null,
+
+};
+
+function zhsEmptyDiag(): ZhsLoginDiag {
+  return {
+    stage: "login",
+    loginStatus: null,
+    tokenCode: null,
+    hopCount: 0,
+    ssoLastStatus: null,
+    ssoLastUrl: "",
+    ssoSawTicket: false,
+    isSkipPolymas: false,
+    hasOncePwd: false,
+    preGetStatus: null,
+  };
+}
 
 type ZhsSignInListResult = zhsSignInListResponse;
 type ZhsSignInDetailResult = zhsSignInDetailResponse;
@@ -2643,113 +2702,299 @@ function zhsEncryptLoginBody(body: Record<string, unknown>): string {
   return JSON.stringify(bytesToBase64(encrypted));
 }
 
+type ZhsHtmlHop = { method: "GET" | "POST"; url: string; body?: string };
+
+function zhsResolveUrl(u: string, base: string): string | null {
+  try {
+    return new URL(u, base).toString();
+  } catch {
+    return null;
+  }
+}
+
+/** A 200 HTML page's next hop, if it redirects: meta refresh, an
+ * auto-submit ticket-transfer form, or a JS location assignment that
+ * is clearly an SSO continuation. A plain CAS *login* form (lt /
+ * execution / _eventId + username/password fields) is a dead end, not
+ * a redirect — it must never be POSTed — and JS location assignments
+ * inside click handlers (e.g. a DownloadApp link) are not redirects
+ * either, so both are ignored. Returns null when the page is a dead end. */
+function zhsNextHopFromHtml(html: string, base: string): ZhsHtmlHop | null {
+  // 1) <meta http-equiv="refresh" content="0;url=...">
+  const meta = html.match(/<meta[^>]*http-equiv\s*=\s*["']?refresh["']?[^>]*>/i);
+  if (meta) {
+    const content = meta[0].match(/content\s*=\s*["']([^"']*)["']/i)?.[1] ?? "";
+    const u = content.match(/url\s*=\s*['"]?\s*([^'";\s]+)/i)?.[1];
+    if (u) {
+      const resolved = zhsResolveUrl(u, base);
+      if (resolved) return { method: "GET", url: resolved };
+    }
+  }
+  // 2) A form is a redirect only when it carries a ticket (CAS/SAML
+  // ticket transfer) or the page auto-submits a hidden-only form.
+  const formOpen = html.match(/<form[^>]*>/i);
+  if (formOpen && formOpen.index !== undefined) {
+    const tag = formOpen[0];
+    const action = tag.match(/action\s*=\s*["']([^"']+)["']/i)?.[1];
+    if (action) {
+      const method = (tag.match(/method\s*=\s*["']([^"']+)["']/i)?.[1] ?? "get").toLowerCase();
+      const url = zhsResolveUrl(action, base);
+      if (url) {
+        const closeAt = html.toLowerCase().indexOf("</form>", formOpen.index);
+        const scope = closeAt >= 0 ? html.slice(formOpen.index, closeAt) : html.slice(formOpen.index);
+        const inputs: Array<[string, string]> = [];
+        const inputRe = /<input[^>]*>/gi;
+        let m: RegExpExecArray | null;
+        while ((m = inputRe.exec(scope)) !== null) {
+          const name = m[0].match(/name\s*=\s*["']([^"']*)["']/i)?.[1];
+          if (name === undefined) continue;
+          const value = m[0].match(/value\s*=\s*["']([^"']*)["']/i)?.[1] ?? "";
+          inputs.push([name, value]);
+        }
+        const names = inputs.map(([n]) => n.toLowerCase());
+        const isTicketForm = names.includes("ticket") || names.includes("samlresponse");
+        const hasVisibleField = /<input[^>]*type\s*=\s*["']?(text|password|tel|email|number)["']?/i.test(scope);
+        const hasAutoSubmit = /\.submit\s*\(\s*\)/.test(html);
+        if (isTicketForm || (hasAutoSubmit && !hasVisibleField)) {
+          const qs = inputs.map(([n, v]) => `${encodeURIComponent(n)}=${encodeURIComponent(v)}`).join("&");
+          if (method === "post") return { method: "POST", url, body: qs };
+          return { method: "GET", url: qs ? url + (url.includes("?") ? "&" : "?") + qs : url };
+        }
+      }
+    }
+  }
+  // 3) JS redirect, only when the target is clearly an SSO continuation
+  // (carries a ticket, points at ssoLogin, or carries a service param).
+  const js =
+    html.match(/(?:window\.)?location(?:\.href)?\s*=\s*["']([^"']+)["']/i) ??
+    html.match(/location\.replace\(\s*["']([^"']+)["']\s*\)/i);
+  if (js?.[1]) {
+    const resolved = zhsResolveUrl(js[1], base);
+    if (resolved && /(ticket=|ssoLogin|service=)/.test(resolved)) return { method: "GET", url: resolved };
+  }
+  return null;
+}
+
+type ZhsFollowResult = { hops: number; lastStatus: number | null; lastUrl: string; sawTicket: boolean };
+
 /**
- * Follow redirects manually (passport CAS -> cloudapi ssoLogin -> target),
- * collecting cookies on every hop. Best-effort: any failure just returns
- * and getToken judges whether the session is usable.
+ * Follow redirects manually (passport CAS -> cloudapi ssoLogin ->
+ * target), collecting cookies on every hop. Returns where the chain
+ * ended instead of void, so the caller can diagnose a dead SSO hop.
+ * A 200 HTML page is followed one more hop when it redirects via meta
+ * refresh, an auto-submit form, or a JS location assignment. The
+ * returned URL has its query string stripped (it may carry a ticket).
  */
-async function zhsFetchFollow(jar: ZhsCookieJar, url: string, signal: AbortSignal): Promise<void> {
+async function zhsFetchFollow(jar: ZhsCookieJar, url: string, signal: AbortSignal): Promise<ZhsFollowResult> {
+  const stripQuery = (u: string): string => {
+    try {
+      const parsed = new URL(u);
+      return `${parsed.origin}${parsed.pathname}`;
+    } catch {
+      return u;
+    }
+  };
+  let method: "GET" | "POST" = "GET";
   let current = url;
-  for (let hop = 0; hop < 8; hop++) {
+  let body: string | undefined;
+  let lastStatus: number | null = null;
+  let hops = 0;
+  let sawTicket = false;
+  for (let hop = 0; hop < 10; hop++) {
     let res: Response;
     try {
       res = await fetch(current, {
-        method: "GET",
-        headers: { ...ZHS_HEADERS, Cookie: jar.header() },
+        method,
+        headers: {
+          ...ZHS_HEADERS,
+          Cookie: jar.header(),
+          ...(method === "POST" ? { "Content-Type": "application/x-www-form-urlencoded" } : {}),
+        },
+        body: method === "POST" ? body : undefined,
         redirect: "manual",
         signal,
       });
     } catch {
-      return;
+      return { hops, lastStatus, lastUrl: stripQuery(current), sawTicket };
     }
     jar.collect(res);
+    lastStatus = res.status;
+    hops++;
+    if (current.includes("ticket=")) sawTicket = true;
     const loc = res.headers.get("location");
+    if (loc && loc.includes("ticket=")) sawTicket = true;
     if (
       (res.status === 301 || res.status === 302 || res.status === 303 || res.status === 307 || res.status === 308) &&
       loc
     ) {
-      current = new URL(loc, current).toString();
+      const next = zhsResolveUrl(loc, current);
+      if (!next) return { hops, lastStatus, lastUrl: stripQuery(current), sawTicket };
+      current = next;
+      method = "GET";
+      body = undefined;
       continue;
     }
-    return;
+    if (res.status === 200) {
+      const ct = res.headers.get("content-type") ?? "";
+      if (ct.includes("text/html")) {
+        let html = "";
+        try {
+          html = await res.text();
+        } catch {
+          return { hops, lastStatus, lastUrl: stripQuery(current), sawTicket };
+        }
+        const next = zhsNextHopFromHtml(html, current);
+        if (next) {
+          current = next.url;
+          method = next.method;
+          body = next.body;
+          continue;
+        }
+      }
+    }
+    return { hops, lastStatus, lastUrl: stripQuery(current), sawTicket };
   }
+  return { hops, lastStatus, lastUrl: stripQuery(current), sawTicket };
 }
 
 /**
- * Full login chain: login/account (encrypted body + user-slid validate)
- * -> CAS SSO hop -> getToken. The password is used for this one login
- * only and goes out of scope when this returns. Returns the token, the
- * user id (best-effort, needed for gesture/QR submits) and the cookie jar.
+ * Full login chain, exactly like the login page does in the browser
+ * (verified 2026-11-23 against the public bundle
+ * /assets/index-C5yo0atL.js + lazy chunk index-D8JpkCJd.js, userStore
+ * goOnceLogin/LoginDirectly):
+ *   0) GET the login page first so the login POST carries the same
+ *      session cookies a browser would have;
+ *   1) POST login/account (encrypted body + user-slid validate) ->
+ *      {status:1, rt:{pwd (one-time password), cacheId, uuid, ...}};
+ *   2) navigate to passport.zhihuishu.com/login?pwd=<rt.pwd>&service=
+ *      <cloudapi ssoLogin?redirect=...> — the one-time pwd is what
+ *      makes passport issue the CAS session (the old code called the
+ *      same URL WITHOUT pwd, so no session was ever created and
+ *      getToken answered 401 "拒绝访问，未登录！");
+ *   3) POST getToken with no body for the Polymas token.
+ * The password is used for this one login only and goes out of scope
+ * when this returns. Returns the token, the user id (best-effort,
+ * needed for gesture/QR submits), the cookie jar and diagnostics.
  */
 async function zhsLoginOnce(
   account: string,
   password: string,
   validate: string,
   signal: AbortSignal,
-): Promise<{ token: string; userId: string; jar: ZhsCookieJar } | { error: string }> {
+): Promise<{ token: string; userId: string; jar: ZhsCookieJar; diag: ZhsLoginDiag } | { error: string; diag: ZhsLoginDiag }> {
   const jar = new ZhsCookieJar();
+  const diag = zhsEmptyDiag();
 
-  // 1) Account login.
+  // 0) Pre-GET the login page (best-effort): collect its session cookies
+  // into the same jar the login POST will use.
+  try {
+    const pre = await fetch("https://login.zhihuishu.com/", {
+      method: "GET",
+      headers: ZHS_HEADERS,
+      redirect: "manual",
+      signal,
+    });
+    jar.collect(pre);
+    diag.preGetStatus = pre.status;
+  } catch {
+    // Non-fatal: the login POST may still work without it.
+  }
+
+  // 1) Account login (manual redirect so Set-Cookie is collected on
+  // every hop instead of being dropped by the default follower).
   let loginRaw: unknown;
   try {
-    const res = await fetch(ZHS_LOGIN_URL, {
+    let res = await fetch(ZHS_LOGIN_URL, {
       method: "POST",
-      headers: ZHS_HEADERS,
+      headers: { ...ZHS_HEADERS, Cookie: jar.header() },
       body: zhsEncryptLoginBody({ account, password, validate }),
+      redirect: "manual",
       signal,
     });
     jar.collect(res);
+    let hops = 0;
+    while (
+      (res.status === 301 || res.status === 302 || res.status === 303 || res.status === 307 || res.status === 308) &&
+      res.headers.get("location") &&
+      hops < 3
+    ) {
+      const next = zhsResolveUrl(res.headers.get("location")!, ZHS_LOGIN_URL);
+      if (!next) break;
+      res = await fetch(next, {
+        method: "GET",
+        headers: { ...ZHS_HEADERS, Cookie: jar.header() },
+        redirect: "manual",
+        signal,
+      });
+      jar.collect(res);
+      hops++;
+    }
     loginRaw = await zhsReadJson(res);
   } catch (e) {
     if (e instanceof DOMException && e.name === "AbortError") {
-      return { error: "智慧树登录超时（60 秒），请稍后再试" };
+      return { error: "智慧树登录超时（60 秒），请稍后再试", diag };
     }
-    return { error: "服务器连不上智慧树登录接口：网络不通或对方暂时不可用，请稍后再试" };
+    return { error: "服务器连不上智慧树登录接口：网络不通或对方暂时不可用，请稍后再试", diag };
   }
   if (!zhsIsObj(loginRaw)) {
-    return { error: "智慧树登录接口返回的内容不是预期的数据格式，登录没有完成" };
+    return { error: "智慧树登录接口返回的内容不是预期的数据格式，登录没有完成", diag };
   }
   const status = loginRaw["status"];
+  diag.loginStatus = typeof status === "number" ? status : null;
+  const rt = zhsIsObj(loginRaw["rt"]) ? loginRaw["rt"] : {};
+  const oncePwd = zhsStr(rt["pwd"]);
+  diag.hasOncePwd = oncePwd !== "";
+  diag.isSkipPolymas = loginRaw["isSkipPolymas"] === true || rt["isSkipPolymas"] === true;
   if (status !== 1) {
     const msg = zhsStr(loginRaw["msg"] ?? loginRaw["message"]);
-    if (msg) return { error: msg };
+    if (msg) return { error: msg, diag };
     if (status === -13) {
-      return { error: "这次登录触发了智慧树的安全验证，需要短信验证：请先去智慧树官网或知到 App 登录一次，通过验证后再回来" };
+      return { error: "这次登录触发了智慧树的安全验证，需要短信验证：请先去智慧树官网或知到 App 登录一次，通过验证后再回来", diag };
     }
     if (status === -5) {
-      return { error: "智慧树说这个密码太简单了：请先去官网改一个更复杂的密码再回来" };
+      return { error: "智慧树说这个密码太简单了：请先去官网改一个更复杂的密码再回来", diag };
     }
-    return { error: "智慧树登录没通过：请检查账号密码后重试" };
+    return { error: "智慧树登录没通过：请检查账号密码后重试", diag };
   }
 
-  // 2) CAS SSO hop, the same redirect the login page does in the browser.
+  // 2) CAS SSO hop, the same navigation the login page does in the
+  // browser: passport with the one-time password, then cloudapi ssoLogin.
+  diag.stage = "sso";
   const service = encodeURIComponent(
     `${ZHS_POLYMAS}/oauth/login/ssoLogin?redirect=${encodeURIComponent("https://www.zhihuishu.com")}`,
   );
-  await zhsFetchFollow(jar, `https://passport.zhihuishu.com/login?service=${service}`, signal);
+  const passportUrl = oncePwd
+    ? `https://passport.zhihuishu.com/login?pwd=${encodeURIComponent(oncePwd)}&service=${service}`
+    : `https://passport.zhihuishu.com/login?service=${service}`;
+  const follow = await zhsFetchFollow(jar, passportUrl, signal);
+  diag.hopCount = follow.hops;
+  diag.ssoLastStatus = follow.lastStatus;
+  diag.ssoLastUrl = follow.lastUrl;
+  diag.ssoSawTicket = follow.sawTicket;
 
-  // 3) Exchange the session for a Polymas token.
+  // 3) Exchange the session for a Polymas token (no body, per the docs).
+  diag.stage = "token";
   let tokRaw: unknown;
   try {
     const res = await fetch(`${ZHS_POLYMAS}/teachingCenterAi/polymasApi/getToken`, {
       method: "POST",
       headers: { ...ZHS_HEADERS, Cookie: jar.header() },
-      body: "{}",
       signal,
     });
     jar.collect(res);
     tokRaw = await zhsReadJson(res);
   } catch (e) {
     if (e instanceof DOMException && e.name === "AbortError") {
-      return { error: "智慧树换 token 超时（60 秒），请稍后再试" };
+      return { error: "智慧树换 token 超时（60 秒），请稍后再试", diag };
     }
-    return { error: "服务器连不上智慧树课堂接口：网络不通或对方暂时不可用，请稍后再试" };
+    return { error: "服务器连不上智慧树课堂接口：网络不通或对方暂时不可用，请稍后再试", diag };
   }
-  const tokCode = zhsIsObj(tokRaw) ? tokRaw["code"] : undefined;
+  const tokCodeRaw = zhsIsObj(tokRaw) ? tokRaw["code"] : undefined;
+  diag.tokenCode = typeof tokCodeRaw === "number" || typeof tokCodeRaw === "string" ? tokCodeRaw : null;
   const token = zhsIsObj(tokRaw) ? zhsStr(tokRaw["data"]) : "";
-  if ((tokCode !== 200 && tokCode !== "200") || !token) {
+  if ((diag.tokenCode !== 200 && diag.tokenCode !== "200") || !token) {
     const m = zhsIsObj(tokRaw) ? zhsStr(tokRaw["msg"] ?? tokRaw["message"]) : "";
-    return { error: m || "登录成功了，但没换到智慧树课堂的 token，签到没法继续" };
+    return { error: m || "登录成功了，但没换到智慧树课堂的 token，签到没法继续", diag };
   }
 
   // 4) User id, best-effort (gesture/QR submits carry it).
@@ -2767,7 +3012,8 @@ async function zhsLoginOnce(
   } catch {
     // Leave userId empty; submits omit the field and Polymas judges.
   }
-  return { token, userId, jar };
+  diag.stage = "done";
+  return { token, userId, jar, diag };
 }
 
 type ZhsPolymasResult = { code: number | string; msg: string; data: unknown; httpStatus: number };
@@ -3036,15 +3282,15 @@ async function relayZhihuishuPrepare(
   password: string,
   validate: string,
 ): Promise<ZhsPrepareResult> {
-  const fail = (message: string): ZhsPrepareResult => ({ ok: false, message, sessionReady: false });
-  if (!validate.trim()) return fail("验证码结果丢了：请重新滑一次验证码再试");
+  const fail = (message: string, diag: ZhsLoginDiag): ZhsPrepareResult => ({ ok: false, message, sessionReady: false, ...diag });
+  if (!validate.trim()) return fail("验证码结果丢了：请重新滑一次验证码再试", zhsEmptyDiag());
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), ZHS_TIMEOUT_MS);
   try {
     const res = await zhsLoginOnce(account, password, validate, ctrl.signal);
-    if ("error" in res) return fail(res.error);
+    if ("error" in res) return fail(res.error, res.diag);
     ZHS_SESSIONS.set(account, { token: res.token, userId: res.userId, jar: res.jar, createdAt: Date.now() });
-    return { ok: true, message: "", sessionReady: true };
+    return { ok: true, message: "", sessionReady: true, ...res.diag };
   } finally {
     clearTimeout(timer);
   }
