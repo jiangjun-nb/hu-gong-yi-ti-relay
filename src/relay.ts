@@ -3342,12 +3342,14 @@ async function relayZhihuishuSignInList(account: string): Promise<ZhsSignInListR
         tried.push(`${p}: ${r.reason instanceof Error ? r.reason.message : "请求失败"}`);
         return;
       }
-      tried.push(`${p}: code ${String(r.value.code)}`);
+      tried.push(`${p}: code ${String(r.value.code)} http ${r.value.httpStatus} msg ${r.value.msg || ""}`);
       if (r.value.code !== 200 && r.value.code !== "200") return;
       if (!workedPath) workedPath = p;
       rows.push(...zhsRowsOf(r.value.data));
     });
     if (!workedPath) {
+      // Diagnostic log only: endpoint paths + response codes, no tokens or cookies.
+      console.log("[zhs-signin-list] no path worked:", JSON.stringify(tried));
       if (results.some((r) => r.status === "fulfilled" && zhsIsExpiredCode(r.value.code))) {
         zhsDropSession(account);
         return fail("智慧树登录过期了（token 被拒）：点「刷新」重新滑一次验证码，再看签到", true, tried);
@@ -3396,6 +3398,7 @@ async function relayZhihuishuSignInList(account: string): Promise<ZhsSignInListR
           }
         }),
     );
+    console.log("[zhs-signin-list] ok:", workedPath, "rows:", rows.length, "activities:", activities.length);
     return {
       ok: true,
       message: "",
