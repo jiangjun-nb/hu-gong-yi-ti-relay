@@ -11,6 +11,9 @@
 // 打到同一个实例上；多实例无共享会话会让签到查不到登录态。
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
+import { basename, join } from "node:path";
+import { randomBytes } from "node:crypto";
 import {
   relayJiaowuSync,
   relayGrades,
@@ -39,6 +42,14 @@ import {
 
 const PORT = Number(process.env.PORT ?? 3000);
 const MAX_BODY_BYTES = 16 * 1024 * 1024; // 15 MB 图片 base64 + 余量
+
+// ---- 临时收件箱：公开上传页收照片和长视频 ----
+// 用户从另一台手机打开公开上传页，把照片/视频传上来，我再从
+// 服务器取回。文件只存在本实例磁盘上（Railway 无持久卷，重新
+// 部署会丢），取回后即删。UPLOAD_TOKEN 未设置时接口全部 404。
+const UPLOAD_DIR = process.env.UPLOAD_DIR ?? join(process.cwd(), "uploads");
+const UPLOAD_TOKEN = process.env.UPLOAD_TOKEN ?? "";
+const MAX_UPLOAD_BYTES = 1024 * 1024 * 1024; // 1 GB 单文件上限
 
 type Json = Record<string, unknown>;
 
@@ -287,6 +298,135 @@ function readBody(req: IncomingMessage): Promise<string> {
   });
 }
 
+// ---- 临时收件箱接口：/api/up/<token>/upload|list|file/<name> ----
+function uploadCorsHeaders(): Record<string, string> {
+  return {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+    "Cache-Control": "no-store",
+  };
+}
+
+function uploadTokenOk(url: URL): boolean {
+  if (!UPLOAD_TOKEN) return false;
+  const parts = url.pathname.split("/").filter(Boolean); // ["api","up",token,...]
+  return parts.length >= 3 && parts[0] === "api" && parts[1] === "up" && parts[2] === UPLOAD_TOKEN;
+}
+
+function uploadFileName(original: string): string {
+  const safe = basename(original).replace(/[/\\:*?"<>|\x00-\x1f]/g, "_").slice(-120) || "file";
+  const stamp = new Date().toISOString().replace(/[-:T.]/g, "").slice(0, 14);
+  return `${stamp}-${randomBytes(4).toString("hex")}-${safe}`;
+}
+
+function uploadContentType(name: string): string {
+  const ext = name.split(".").pop()?.toLowerCase() ?? "";
+  if (ext === "mp4" || ext === "mov" || ext === "m4v") return "video/mp4";
+  if (ext === "png") return "image/png";
+  if (ext === "gif") return "image/gif";
+  if (ext === "webp") return "image/webp";
+  if (ext === "heic" || ext === "heif") return "image/heic";
+  if (ext === "jpg" || ext === "jpeg") return "image/jpeg";
+  if (ext === "mp3") return "audio/mpeg";
+  return "application/octet-stream";
+}
+
+async function handleUploadApi(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+  const headers = uploadCorsHeaders();
+  const send = (status: number, obj: unknown) => {
+    res.writeHead(status, { ...headers, "Content-Type": "application/json; charset=utf-8" });
+    res.end(JSON.stringify(obj));
+  };
+  if (!uploadTokenOk(url)) {
+    send(404, { ok: false, message: "没有这个接口" });
+    return;
+  }
+  const parts = url.pathname.split("/").filter(Boolean);
+  const action = parts[3] ?? "";
+
+  if (req.method === "GET" && action === "list") {
+    mkdirSync(UPLOAD_DIR, { recursive: true });
+    const files = readdirSync(UPLOAD_DIR)
+      .map((name) => {
+        const st = statSync(join(UPLOAD_DIR, name));
+        return { name, size: st.size, mtime: st.mtimeMs };
+      })
+      .sort((a, b) => b.mtime - a.mtime);
+    send(200, { ok: true, files });
+    return;
+  }
+
+  if (req.method === "GET" && action === "file") {
+    let name = "";
+    try {
+      name = basename(decodeURIComponent(parts[4] ?? ""));
+    } catch {
+      name = "";
+    }
+    const file = join(UPLOAD_DIR, name);
+    if (!name || !existsSync(file) || !statSync(file).isFile()) {
+      send(404, { ok: false, message: "文件不存在" });
+      return;
+    }
+    const st = statSync(file);
+    res.writeHead(200, {
+      ...headers,
+      "Content-Type": uploadContentType(name),
+      "Content-Disposition": `attachment; filename="${encodeURIComponent(name)}"`,
+      "Content-Length": String(st.size),
+    });
+    createReadStream(file).pipe(res);
+    return;
+  }
+
+  if (req.method === "POST" && action === "upload") {
+    const original = url.searchParams.get("filename") ?? "file";
+    const name = uploadFileName(original);
+    mkdirSync(UPLOAD_DIR, { recursive: true });
+    const file = join(UPLOAD_DIR, name);
+    const out = createWriteStream(file);
+    let size = 0;
+    try {
+      await new Promise<void>((resolve, reject) => {
+        req.on("data", (chunk: Buffer) => {
+          size += chunk.length;
+          if (size > MAX_UPLOAD_BYTES) {
+            req.destroy();
+            out.destroy(new Error("文件过大"));
+            reject(new Error("文件过大"));
+            return;
+          }
+          if (!out.write(chunk)) req.pause();
+        });
+        out.on("drain", () => req.resume());
+        req.on("end", () => out.end());
+        out.on("finish", () => resolve());
+        req.on("error", (e) => {
+          out.destroy();
+          reject(e);
+        });
+        out.on("error", (e) => {
+          req.destroy();
+          reject(e);
+        });
+      });
+    } catch (e) {
+      try {
+        if (existsSync(file)) unlinkSync(file);
+      } catch {
+        /* ignore */
+      }
+      send(400, { ok: false, message: e instanceof Error ? e.message : "上传失败" });
+      return;
+    }
+    send(200, { ok: true, name, size, originalName: original });
+    return;
+  }
+
+  send(404, { ok: false, message: "没有这个接口" });
+}
+
 const server = createServer(async (req, res) => {
   const started = Date.now();
   const url = new URL(req.url ?? "/", "http://localhost");
@@ -302,6 +442,10 @@ const server = createServer(async (req, res) => {
     }
     if (req.method === "GET" && path === "/") {
       sendJson(res, 200, { ok: true, service: "hu-gong-yi-ti-public-relay", routes: ROUTE_LIST });
+      return;
+    }
+    if (path.startsWith("/api/up/")) {
+      await handleUploadApi(req, res, url);
       return;
     }
     if (req.method !== "POST") {
@@ -324,11 +468,13 @@ const server = createServer(async (req, res) => {
     const result = await handler(body);
     sendJson(res, 200, result);
   } catch (e) {
-    if (e instanceof BadRequest) {
-      sendJson(res, 400, { ok: false, message: e.message });
-    } else {
-      // 不把上游细节和堆栈打出去，也不记请求体。
-      sendJson(res, 500, { ok: false, message: "服务器内部错误，请稍后再试" });
+    if (!res.headersSent) {
+      if (e instanceof BadRequest) {
+        sendJson(res, 400, { ok: false, message: e.message });
+      } else {
+        // 不把上游细节和堆栈打出去，也不记请求体。
+        sendJson(res, 500, { ok: false, message: "服务器内部错误，请稍后再试" });
+      }
     }
   } finally {
     const ms = Date.now() - started;
