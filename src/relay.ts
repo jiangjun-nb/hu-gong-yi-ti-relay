@@ -1825,9 +1825,14 @@ async function relayLazynutSolveQuestion(input: {
     );
     if (res.status === 429) return fail("解析服务今天太忙了，稍后再试一次");
     if (!res.ok) {
-      // 只记状态码，不记任何密钥和请求体，方便定位是 key、权限还是模型的问题。
-      console.log(`[gemini] upstream status ${res.status}`);
-      return fail(`解析服务出错了（Gemini 返回 ${res.status}），稍后再试一次`);
+      // 只记状态码和谷歌返回的错误文案，不记任何密钥和请求体。
+      let detail = "";
+      try {
+        const errBody = (await res.json()) as { error?: { message?: string } };
+        if (errBody?.error?.message) detail = "：" + String(errBody.error.message).slice(0, 200);
+      } catch { /* 解析失败就只报状态码 */ }
+      console.log(`[gemini] upstream status ${res.status}${detail}`);
+      return fail(`解析服务出错了（Gemini 返回 ${res.status}${detail}），稍后再试一次`);
     }
     const data = (await res.json()) as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
     const text = (data.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("").trim();
