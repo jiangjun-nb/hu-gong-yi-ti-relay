@@ -1815,16 +1815,20 @@ async function relayLazynutSolveQuestion(input: {
   const timer = setTimeout(() => ctrl.abort(), GEMINI_TIMEOUT_MS);
   try {
     const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
+      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(key)}`,
       {
         method: "POST",
-        headers: { "Content-Type": "application/json", "x-goog-api-key": key },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ contents: [{ parts: [{ text: geminiSolvePrompt(question, input.options || [], input.type || "") }] }] }),
         signal: ctrl.signal,
       },
     );
     if (res.status === 429) return fail("解析服务今天太忙了，稍后再试一次");
-    if (!res.ok) return fail("解析服务出错了，稍后再试一次");
+    if (!res.ok) {
+      // 只记状态码，不记任何密钥和请求体，方便定位是 key、权限还是模型的问题。
+      console.log(`[gemini] upstream status ${res.status}`);
+      return fail(`解析服务出错了（Gemini 返回 ${res.status}），稍后再试一次`);
+    }
     const data = (await res.json()) as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
     const text = (data.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("").trim();
     if (!text) return fail("解析服务没返回内容，再试一次");
