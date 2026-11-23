@@ -1,0 +1,1 @@
+{"description":"湖工一体公开版中转服务器：教务、至评卓学、智慧树签到、拓强查电费的中转接口，零依赖，Node.js 直跑。","engines":{"node":">=20"},"name":"hu-gong-yi-ti-public-relay","private":true,"scripts":{"build":"tsc","dev":"node --watch dist/server.js","start":"node dist/server.js"},"type":"module","version":"1.0.0","devDependencies":{"@types/node":"^22.20.5","typescript":"^5.9.3"}}
