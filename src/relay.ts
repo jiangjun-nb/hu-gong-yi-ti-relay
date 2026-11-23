@@ -3282,7 +3282,11 @@ async function relayZhihuishuPrepare(
   password: string,
   validate: string,
 ): Promise<ZhsPrepareResult> {
-  const fail = (message: string, diag: ZhsLoginDiag): ZhsPrepareResult => ({ ok: false, message, sessionReady: false, ...diag });
+  const fail = (message: string, diag: ZhsLoginDiag): ZhsPrepareResult => {
+    // Diagnostic log only: stage/status codes, never passwords, validate values, cookies or tokens.
+    console.log("[zhs-prepare] fail:", message, JSON.stringify(diag));
+    return { ok: false, message, sessionReady: false, ...diag };
+  };
   if (!validate.trim()) return fail("验证码结果丢了：请重新滑一次验证码再试", zhsEmptyDiag());
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), ZHS_TIMEOUT_MS);
@@ -3290,6 +3294,7 @@ async function relayZhihuishuPrepare(
     const res = await zhsLoginOnce(account, password, validate, ctrl.signal);
     if ("error" in res) return fail(res.error, res.diag);
     ZHS_SESSIONS.set(account, { token: res.token, userId: res.userId, jar: res.jar, createdAt: Date.now() });
+    console.log("[zhs-prepare] ok:", JSON.stringify(res.diag));
     return { ok: true, message: "", sessionReady: true, ...res.diag };
   } finally {
     clearTimeout(timer);
