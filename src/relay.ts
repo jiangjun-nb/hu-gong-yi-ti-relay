@@ -2545,6 +2545,10 @@ class ZhsCookieJar {
   header(): string {
     return [...this.cookies.entries()].map(([k, v]) => `${k}=${v}`).join("; ");
   }
+
+  get(name: string): string {
+    return this.cookies.get(name) ?? "";
+  }
 }
 
 type ZhsSession = { token: string; userId: string; jar: ZhsCookieJar; createdAt: number };
@@ -2972,6 +2976,15 @@ async function zhsLoginOnce(
   diag.ssoLastUrl = follow.lastUrl;
   diag.ssoSawTicket = follow.sawTicket;
 
+  // Diagnostic only: which auth-cookie NAMES the SSO chain left in the
+  // jar (never values). The classroom H5 reads its API token from these
+  // cookies (jt-cas / ai-poly / openapi-token / cloudapi-token, first
+  // non-empty), not from getToken.
+  const authCookieNames = ["jt-cas", "ai-poly", "openapi-token", "cloudapi-token", "aic-zhs-u"].filter(
+    (n) => jar.get(n) !== "",
+  );
+  console.log("[zhs-prepare] authcookies:", authCookieNames.join(",") || "(none)");
+
   // 3) Exchange the session for a Polymas token. The real browser flows
   // (login page bundle + Polymas H5 bundle) call this with axios .get and
   // no params; the POST variant 500s ("操作失败"), so mirror the GET.
@@ -3030,6 +3043,29 @@ async function zhsLoginOnce(
 
 type ZhsPolymasResult = { code: number | string; msg: string; data: unknown; httpStatus: number };
 
+/**
+ * Auth-token candidates for Polymas student-app calls, in the order the
+ * classroom H5 tries them (its Vf(): first non-empty cookie among
+ * jt-cas / ai-poly / openapi-token / cloudapi-token), falling back to the
+ * getToken token. Only NAMES are ever logged, never values. Duplicate
+ * values are tried once.
+ */
+function zhsAuthCandidates(session: ZhsSession): { name: string; value: string }[] {
+  const out: { name: string; value: string }[] = [];
+  const seen = new Set<string>();
+  for (const name of ["jt-cas", "ai-poly", "openapi-token", "cloudapi-token"]) {
+    const v = session.jar.get(name);
+    if (v && !seen.has(v)) {
+      seen.add(v);
+      out.push({ name, value: v });
+    }
+  }
+  if (session.token && !seen.has(session.token)) {
+    out.push({ name: "getToken", value: session.token });
+  }
+  return out;
+}
+
 async function zhsPolymasFetch(
   session: ZhsSession,
   method: "GET" | "POST",
@@ -3037,39 +3073,57 @@ async function zhsPolymasFetch(
   body: Record<string, unknown> | undefined,
   signal: AbortSignal,
 ): Promise<ZhsPolymasResult> {
-  let res: Response;
-  try {
-    res = await fetch(`${ZHS_POLYMAS}${path}`, {
-      method,
-      headers: {
-        "Content-Type": "application/json;charset=UTF-8",
-        Authorization: session.token,
-        ...(session.userId ? { Zhsuid: session.userId } : {}),
-        Cookie: session.jar.header(),
-        Origin: "https://classroom-h5.polymas.com",
-        Referer: "https://classroom-h5.polymas.com/",
-        "User-Agent": ZHS_UA,
-      },
-      body: body === undefined ? undefined : JSON.stringify(body),
-      signal,
-    });
-  } catch (e) {
-    if (e instanceof DOMException && e.name === "AbortError") {
-      throw new Error("智慧树课堂接口响应超时（60 秒），请稍后再试");
+  // Try each credential in turn; a 401 means this one is not accepted
+  // for this endpoint, so move to the next instead of failing outright.
+  // Zhsuid comes from the aic-zhs-u cookie when present, else the user
+  // id from getLoginUserInfo.
+  const candidates = zhsAuthCandidates(session);
+  const zhsuid = session.jar.get("aic-zhs-u") || session.userId;
+  const attempts = candidates.length ? candidates : [{ name: "(none)", value: "" }];
+  let last: ZhsPolymasResult | null = null;
+  for (const cand of attempts) {
+    let res: Response;
+    try {
+      res = await fetch(`${ZHS_POLYMAS}${path}`, {
+        method,
+        headers: {
+          "Content-Type": "application/json;charset=UTF-8",
+          ...(cand.value ? { Authorization: cand.value } : {}),
+          ...(zhsuid ? { Zhsuid: zhsuid } : {}),
+          Cookie: session.jar.header(),
+          Origin: "https://classroom-h5.polymas.com",
+          Referer: "https://classroom-h5.polymas.com/",
+          "User-Agent": ZHS_UA,
+        },
+        body: body === undefined ? undefined : JSON.stringify(body),
+        signal,
+      });
+    } catch (e) {
+      if (e instanceof DOMException && e.name === "AbortError") {
+        throw new Error("智慧树课堂接口响应超时（60 秒），请稍后再试");
+      }
+      throw new Error("服务器连不上智慧树课堂接口：网络不通或对方暂时不可用，请稍后再试");
     }
-    throw new Error("服务器连不上智慧树课堂接口：网络不通或对方暂时不可用，请稍后再试");
+    session.jar.collect(res);
+    const raw = await zhsReadJson(res);
+    if (!zhsIsObj(raw)) {
+      throw new Error(`智慧树课堂接口返回的内容不是预期的数据格式（HTTP ${res.status}），这次操作没有完成`);
+    }
+    const result: ZhsPolymasResult = {
+      code: raw["code"] as number | string,
+      msg: zhsStr(raw["msg"] ?? raw["message"]),
+      data: raw["data"],
+      httpStatus: res.status,
+    };
+    if (!zhsIsExpiredCode(result.code)) return result;
+    // 401: this credential is not accepted here; try the next one.
+    console.log(`[zhs-auth] 401 with ${cand.name} on ${path}, trying next candidate`);
+    last = result;
   }
-  session.jar.collect(res);
-  const raw = await zhsReadJson(res);
-  if (!zhsIsObj(raw)) {
-    throw new Error(`智慧树课堂接口返回的内容不是预期的数据格式（HTTP ${res.status}），这次操作没有完成`);
-  }
-  return {
-    code: raw["code"] as number | string,
-    msg: zhsStr(raw["msg"] ?? raw["message"]),
-    data: raw["data"],
-    httpStatus: res.status,
-  };
+  // Every candidate got a 401; return the last one so callers see the
+  // expired-code path (and drop the session) exactly as before.
+  if (last) return last;
+  throw new Error("智慧树课堂接口没有返回可用结果");
 }
 
 function zhsIsExpiredCode(code: number | string): boolean {
