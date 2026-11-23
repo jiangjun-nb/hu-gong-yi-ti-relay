@@ -3005,7 +3005,8 @@ async function zhsLoginOnce(
     return { error: m || "登录成功了，但没换到智慧树课堂的 token，签到没法继续", diag };
   }
 
-  // 4) User id, best-effort (gesture/QR submits carry it).
+  // 4) User id, best-effort (gesture/QR submits carry it; the student-app
+  // calls may also want it as a Zhsuid header).
   let userId = "";
   try {
     const info = await zhsPolymasFetch(
@@ -3017,7 +3018,10 @@ async function zhsLoginOnce(
     );
     const d = zhsIsObj(info.data) ? info.data : {};
     userId = zhsPick(d, ["userId", "id", "stuNid", "studentId"]);
+    // Diagnostic only: response code + whether an id was found, never the id itself.
+    console.log("[zhs-prepare] userinfo: code", String(info.code), "hasUserId:", userId !== "");
   } catch {
+    console.log("[zhs-prepare] userinfo: request failed, hasUserId: false");
     // Leave userId empty; submits omit the field and Polymas judges.
   }
   diag.stage = "done";
@@ -3040,6 +3044,7 @@ async function zhsPolymasFetch(
       headers: {
         "Content-Type": "application/json;charset=UTF-8",
         Authorization: session.token,
+        ...(session.userId ? { Zhsuid: session.userId } : {}),
         Cookie: session.jar.header(),
         Origin: "https://classroom-h5.polymas.com",
         Referer: "https://classroom-h5.polymas.com/",
