@@ -1756,19 +1756,20 @@ async function relayLazynutSubmission(
   }
 }
 
-// ---------- 高数作业 AI 解析（Hugging Face 推理接口） ----------
+// ---------- 高数作业 AI 解析（Mistral 免费接口） ----------
 //
 // 点「解析」时：平台标准答案优先；平台没给（交卷前不给）才调这里。
-// 服务器端调 Hugging Face Inference API（router.huggingface.co，
-// OpenAI 兼容格式，模型 Qwen2.5-72B-Instruct）现场解题，分步写，
+// 服务器端调 Mistral La Plateforme 免费接口（api.mistral.ai，
+// OpenAI 兼容格式，模型 mistral-small-latest）现场解题，分步写，
 // 公式用 $...$ / $$...$$，前端 KaTeX 渲染。
-// 密钥只读环境变量 HF_API_KEY（Railway Variables 里配），绝不进
+// 密钥只读环境变量 MISTRAL_API_KEY（Railway Variables 里配），绝不进
 // 页面、不记日志。同一题目只解一次：按 questionId（没有就按题干+
 // 选项）缓存在进程内存里，省额度、也省时间。
 // 注：原来接 Google Gemini 2.5 Flash（该谷歌账号新项目一律无法用
 // 免费层级，403），后改 Groq（账号三次 signup_blocked），再改
-// OpenRouter（云端浏览器网络被禁注册），2026-11-24 最终改接
-// Hugging Face 免费推理接口（无需绑卡）。
+// OpenRouter（云端浏览器网络被禁注册），再改 Hugging Face 推理接口
+// （router 一律 402：免费账号无月度额度，需买 credits 或开 PRO），
+// 2026-11-24 最终改接 Mistral 免费接口（无需绑卡）。
 type LazynutSolveResult = {
   ok: boolean;
   message: string;
@@ -1776,17 +1777,17 @@ type LazynutSolveResult = {
   cached: boolean;
 };
 
-const HF_MODEL = process.env.HF_MODEL || "Qwen/Qwen2.5-72B-Instruct";
-const HF_TIMEOUT_MS = 90000;
-const HF_CACHE_MAX = 500;
-const hfSolveCache = new Map<string, string>();
+const MISTRAL_MODEL = process.env.MISTRAL_MODEL || "mistral-small-latest";
+const MISTRAL_TIMEOUT_MS = 60000;
+const MISTRAL_CACHE_MAX = 500;
+const mistralSolveCache = new Map<string, string>();
 
-function hfSolveKey(questionId: string, question: string, options: string[], type: string): string {
+function mistralSolveKey(questionId: string, question: string, options: string[], type: string): string {
   if (questionId) return "id:" + questionId;
   return "q:" + type + "|" + question + "|" + options.join("‖");
 }
 
-function hfSolvePrompt(question: string, options: string[], type: string): string {
+function mistralSolvePrompt(question: string, options: string[], type: string): string {
   const t = (type || "").toUpperCase();
   const isChoice = /CHOICE|SINGLE|MULTI/.test(t);
   const optText = options.length
@@ -1808,23 +1809,23 @@ async function relayLazynutSolveQuestion(input: {
   type: string;
 }): Promise<LazynutSolveResult> {
   const fail = (message: string): LazynutSolveResult => ({ ok: false, message, answer: "", cached: false });
-  const key = (process.env.HF_API_KEY || "").trim();
+  const key = (process.env.MISTRAL_API_KEY || "").trim();
   if (!key) return fail("解析服务还没配好，请联系阿珍");
   const question = (input.question || "").trim();
   if (!question) return fail("没有题目内容，解不了");
-  const cacheKey = hfSolveKey((input.questionId || "").trim(), question, input.options || [], input.type || "");
-  const hit = hfSolveCache.get(cacheKey);
+  const cacheKey = mistralSolveKey((input.questionId || "").trim(), question, input.options || [], input.type || "");
+  const hit = mistralSolveCache.get(cacheKey);
   if (hit) return { ok: true, message: "", answer: hit, cached: true };
 
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), HF_TIMEOUT_MS);
+  const timer = setTimeout(() => ctrl.abort(), MISTRAL_TIMEOUT_MS);
   try {
-    const res = await fetch("https://router.huggingface.co/v1/chat/completions", {
+    const res = await fetch("https://api.mistral.ai/v1/chat/completions", {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
       body: JSON.stringify({
-        model: HF_MODEL,
-        messages: [{ role: "user", content: hfSolvePrompt(question, input.options || [], input.type || "") }],
+        model: MISTRAL_MODEL,
+        messages: [{ role: "user", content: mistralSolvePrompt(question, input.options || [], input.type || "") }],
         temperature: 0.2,
         max_tokens: 2048,
       }),
@@ -1838,17 +1839,17 @@ async function relayLazynutSolveQuestion(input: {
         const errBody = (await res.json()) as { error?: { message?: string } };
         if (errBody?.error?.message) detail = "：" + String(errBody.error.message).slice(0, 200);
       } catch { /* 解析失败就只报状态码 */ }
-      console.log(`[hf] upstream status ${res.status}${detail}`);
-      return fail(`解析服务出错了（HF 返回 ${res.status}${detail}），稍后再试一次`);
+      console.log(`[mistral] upstream status ${res.status}${detail}`);
+      return fail(`解析服务出错了（Mistral 返回 ${res.status}${detail}），稍后再试一次`);
     }
     const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
     const text = (data.choices?.[0]?.message?.content || "").trim();
     if (!text) return fail("解析服务没返回内容，再试一次");
-    if (hfSolveCache.size >= HF_CACHE_MAX) {
-      const first = hfSolveCache.keys().next().value;
-      if (first !== undefined) hfSolveCache.delete(first);
+    if (mistralSolveCache.size >= MISTRAL_CACHE_MAX) {
+      const first = mistralSolveCache.keys().next().value;
+      if (first !== undefined) mistralSolveCache.delete(first);
     }
-    hfSolveCache.set(cacheKey, text);
+    mistralSolveCache.set(cacheKey, text);
     return { ok: true, message: "", answer: text, cached: false };
   } catch (e) {
     return fail(e instanceof Error && e.name === "AbortError" ? "解析超时了，再试一次" : "解析服务出错了，稍后再试一次");
