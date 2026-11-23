@@ -332,6 +332,18 @@ function uploadContentType(name: string): string {
   return "application/octet-stream";
 }
 
+// ---- 分片上传：大文件切成小块传，断了只重传那一块 ----
+// chunk: POST /api/up/<token>/chunk?uploadId=<id>&index=<i>&total=<n>（单块 ≤16MB）
+// complete: POST /api/up/<token>/complete?uploadId=<id>&filename=<name>&total=<n>&size=<bytes>
+const CHUNK_DIR = join(UPLOAD_DIR, ".chunks");
+const CHUNK_MAX_BYTES = 16 * 1024 * 1024;
+function validUploadId(id: string): boolean {
+  return /^[A-Za-z0-9_-]{8,64}$/.test(id);
+}
+function chunkPartPath(uploadId: string, index: number): string {
+  return join(CHUNK_DIR, `${uploadId}.${index}.part`);
+}
+
 async function handleUploadApi(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
   const headers = uploadCorsHeaders();
   const send = (status: number, obj: unknown) => {
@@ -348,6 +360,13 @@ async function handleUploadApi(req: IncomingMessage, res: ServerResponse, url: U
   if (req.method === "GET" && action === "list") {
     mkdirSync(UPLOAD_DIR, { recursive: true });
     const files = readdirSync(UPLOAD_DIR)
+      .filter((name) => {
+        try {
+          return statSync(join(UPLOAD_DIR, name)).isFile();
+        } catch {
+          return false;
+        }
+      })
       .map((name) => {
         const st = statSync(join(UPLOAD_DIR, name));
         return { name, size: st.size, mtime: st.mtimeMs };
@@ -421,6 +440,131 @@ async function handleUploadApi(req: IncomingMessage, res: ServerResponse, url: U
       return;
     }
     send(200, { ok: true, name, size, originalName: original });
+    return;
+  }
+
+  if (req.method === "POST" && action === "chunk") {
+    const uploadId = url.searchParams.get("uploadId") ?? "";
+    const index = Number(url.searchParams.get("index") ?? "-1");
+    const total = Number(url.searchParams.get("total") ?? "0");
+    if (
+      !validUploadId(uploadId) ||
+      !Number.isInteger(index) ||
+      index < 0 ||
+      !Number.isInteger(total) ||
+      total < 1 ||
+      total > 1000 ||
+      index >= total
+    ) {
+      send(400, { ok: false, message: "参数不对" });
+      return;
+    }
+    mkdirSync(CHUNK_DIR, { recursive: true });
+    const file = chunkPartPath(uploadId, index);
+    const out = createWriteStream(file);
+    let size = 0;
+    try {
+      await new Promise<void>((resolve, reject) => {
+        req.on("data", (chunk: Buffer) => {
+          size += chunk.length;
+          if (size > CHUNK_MAX_BYTES) {
+            req.destroy();
+            out.destroy(new Error("分片过大"));
+            reject(new Error("分片过大"));
+            return;
+          }
+          if (!out.write(chunk)) req.pause();
+        });
+        out.on("drain", () => req.resume());
+        req.on("end", () => out.end());
+        out.on("finish", () => resolve());
+        req.on("error", (e) => {
+          out.destroy();
+          reject(e);
+        });
+        out.on("error", (e) => {
+          req.destroy();
+          reject(e);
+        });
+      });
+    } catch (e) {
+      try {
+        if (existsSync(file)) unlinkSync(file);
+      } catch {
+        /* ignore */
+      }
+      send(400, { ok: false, message: e instanceof Error ? e.message : "分片上传失败" });
+      return;
+    }
+    send(200, { ok: true, index, size });
+    return;
+  }
+
+  if (req.method === "POST" && action === "complete") {
+    const uploadId = url.searchParams.get("uploadId") ?? "";
+    const original = url.searchParams.get("filename") ?? "file";
+    const total = Number(url.searchParams.get("total") ?? "0");
+    const expectSize = Number(url.searchParams.get("size") ?? "0");
+    if (
+      !validUploadId(uploadId) ||
+      !Number.isInteger(total) ||
+      total < 1 ||
+      total > 1000
+    ) {
+      send(400, { ok: false, message: "参数不对" });
+      return;
+    }
+    let sum = 0;
+    for (let i = 0; i < total; i++) {
+      const p = chunkPartPath(uploadId, i);
+      if (!existsSync(p) || !statSync(p).isFile()) {
+        send(400, { ok: false, message: `缺少第 ${i + 1} 块，重新传它` });
+        return;
+      }
+      sum += statSync(p).size;
+    }
+    if (sum > MAX_UPLOAD_BYTES) {
+      send(400, { ok: false, message: "文件过大" });
+      return;
+    }
+    if (expectSize > 0 && sum !== expectSize) {
+      send(400, { ok: false, message: "大小对不上，重新传" });
+      return;
+    }
+    const name = uploadFileName(original);
+    mkdirSync(UPLOAD_DIR, { recursive: true });
+    const dest = join(UPLOAD_DIR, name);
+    try {
+      const out = createWriteStream(dest);
+      for (let i = 0; i < total; i++) {
+        await new Promise<void>((resolve, reject) => {
+          const rs = createReadStream(chunkPartPath(uploadId, i));
+          rs.on("error", reject);
+          rs.pipe(out, { end: false });
+          rs.on("end", () => resolve());
+        });
+      }
+      await new Promise<void>((resolve, reject) => {
+        out.end(() => resolve());
+        out.on("error", reject);
+      });
+    } catch {
+      try {
+        if (existsSync(dest)) unlinkSync(dest);
+      } catch {
+        /* ignore */
+      }
+      send(400, { ok: false, message: "合并失败" });
+      return;
+    }
+    for (let i = 0; i < total; i++) {
+      try {
+        unlinkSync(chunkPartPath(uploadId, i));
+      } catch {
+        /* ignore */
+      }
+    }
+    send(200, { ok: true, name, size: sum, originalName: original });
     return;
   }
 
