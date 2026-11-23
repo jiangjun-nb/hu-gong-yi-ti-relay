@@ -22,6 +22,7 @@ import {
   relayLazynutDeleteImage,
   relayLazynutSave,
   relayLazynutSubmission,
+  relayLazynutSolveQuestion,
   relayLazynutSignInList,
   relayLazynutSignInDetail,
   relayLazynutSignInRecords,
@@ -174,6 +175,13 @@ const ROUTES: Record<string, Handler> = {
     const c = lzCreds(b);
     return relayLazynutSubmission(c.username, c.password, c.school, reqStr(b, "submissionId", 80));
   },
+  "/api/lazynut/solve-question": async (b) =>
+    relayLazynutSolveQuestion({
+      questionId: optStr(b, "questionId", 120) ?? "",
+      question: reqStr(b, "question", 4000),
+      options: (optArr(b, "options") as unknown[]).filter((o): o is string => typeof o === "string").slice(0, 12),
+      type: optStr(b, "type", 40) ?? "",
+    }),
   "/api/lazynut/signin-list": async (b) => {
     const c = lzCreds(b);
     return relayLazynutSignInList(c.username, c.password, c.school);

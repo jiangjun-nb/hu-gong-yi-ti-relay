@@ -1756,6 +1756,91 @@ async function relayLazynutSubmission(
   }
 }
 
+// ---------- 高数作业 AI 解析（Gemini） ----------
+//
+// 点「解析」时：平台标准答案优先；平台没给（交卷前不给）才调这里。
+// 服务器端调 Google Gemini 2.5 Flash 现场解题，分步写，公式用
+// $...$ / $$...$$，前端 KaTeX 渲染。密钥只读环境变量
+// GEMINI_API_KEY（Railway Variables 里配），绝不进页面、不记日志。
+// 同一题目只解一次：按 questionId（没有就按题干+选项）缓存在进程
+// 内存里，省额度、也省时间。
+type LazynutSolveResult = {
+  ok: boolean;
+  message: string;
+  answer: string;
+  cached: boolean;
+};
+
+const GEMINI_MODEL = "gemini-2.5-flash";
+const GEMINI_TIMEOUT_MS = 60000;
+const GEMINI_CACHE_MAX = 500;
+const geminiSolveCache = new Map<string, string>();
+
+function geminiSolveKey(questionId: string, question: string, options: string[], type: string): string {
+  if (questionId) return "id:" + questionId;
+  return "q:" + type + "|" + question + "|" + options.join("‖");
+}
+
+function geminiSolvePrompt(question: string, options: string[], type: string): string {
+  const t = (type || "").toUpperCase();
+  const isChoice = /CHOICE|SINGLE|MULTI/.test(t);
+  const optText = options.length
+    ? "\n选项：\n" + options.map((o, i) => String.fromCharCode(65 + i) + ". " + o).join("\n")
+    : "";
+  return [
+    "你是一位大学高等数学老师，正在给大一学生讲一道作业题。请分步讲解，讲清每一步用的定理或方法。",
+    isChoice ? "这是选择题：先给出正确选项的字母，再分步讲解为什么。" : "先给出最终答案，再分步讲解。",
+    "要求：公式用 $...$ 行内、$$...$$ 独立；步骤简明，不要废话；最后用一句话总结关键点；只输出解析本身，不要寒暄。",
+    "",
+    "题目：" + question + optText,
+  ].join("\n");
+}
+
+async function relayLazynutSolveQuestion(input: {
+  questionId: string;
+  question: string;
+  options: string[];
+  type: string;
+}): Promise<LazynutSolveResult> {
+  const fail = (message: string): LazynutSolveResult => ({ ok: false, message, answer: "", cached: false });
+  const key = (process.env.GEMINI_API_KEY || "").trim();
+  if (!key) return fail("解析服务还没配好，请联系阿珍");
+  const question = (input.question || "").trim();
+  if (!question) return fail("没有题目内容，解不了");
+  const cacheKey = geminiSolveKey((input.questionId || "").trim(), question, input.options || [], input.type || "");
+  const hit = geminiSolveCache.get(cacheKey);
+  if (hit) return { ok: true, message: "", answer: hit, cached: true };
+
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), GEMINI_TIMEOUT_MS);
+  try {
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-goog-api-key": key },
+        body: JSON.stringify({ contents: [{ parts: [{ text: geminiSolvePrompt(question, input.options || [], input.type || "") }] }] }),
+        signal: ctrl.signal,
+      },
+    );
+    if (res.status === 429) return fail("解析服务今天太忙了，稍后再试一次");
+    if (!res.ok) return fail("解析服务出错了，稍后再试一次");
+    const data = (await res.json()) as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
+    const text = (data.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("").trim();
+    if (!text) return fail("解析服务没返回内容，再试一次");
+    if (geminiSolveCache.size >= GEMINI_CACHE_MAX) {
+      const first = geminiSolveCache.keys().next().value;
+      if (first !== undefined) geminiSolveCache.delete(first);
+    }
+    geminiSolveCache.set(cacheKey, text);
+    return { ok: true, message: "", answer: text, cached: false };
+  } catch (e) {
+    return fail(e instanceof Error && e.name === "AbortError" ? "解析超时了，再试一次" : "解析服务出错了，稍后再试一次");
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // ---------- 至评卓学签到 relay (server-side) ----------
 //
 // Endpoints reverse-engineered from the official 至评卓学 Android App
@@ -4152,6 +4237,7 @@ export {
   relayLazynutDeleteImage,
   relayLazynutSave,
   relayLazynutSubmission,
+  relayLazynutSolveQuestion,
   relayLazynutSignInList,
   relayLazynutSignInDetail,
   relayLazynutSignInRecords,
